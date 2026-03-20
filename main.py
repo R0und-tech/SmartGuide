@@ -5,13 +5,12 @@ Main loop:
   • every 5 seconds checks MotionDetector
   • on motion → take photo (OpenCV)
   • send photo to GigaChat-Pro
-  • speak the description with pyttsx3 (Russian voice)
+  • speak the description with Yandex SpeechKit
 """
 
 import cv2
 import time
 import subprocess
-#import pyttsx3
 from langchain_gigachat.chat_models import GigaChat
 from langchain_core.messages import HumanMessage
 from motion_detector import MotionDetector
@@ -20,7 +19,8 @@ from speechkit_tts import say_it, set_speechkit_key
 # --------------------------------------------------------------------- #
 # Configuration
 # --------------------------------------------------------------------- #
-GIGACHAT_CREDENTIALS = ""
+GIGACHAT_CREDENTIALS = "ваш_ключ_здесь"          
+SPEECHKIT_API_KEY = "ваш_api_ключ_здесь"        
 CAMERA_INDEX = 0                   # 0 = default Raspberry Pi camera
 PHOTO_PATH = "/tmp/image.jpg"
 CHECK_INTERVAL = 5                 # seconds between motion checks
@@ -36,39 +36,30 @@ llm = GigaChat(
 )
 
 # --------------------------------------------------------------------- #
-# Text-to-Speech (Russian)
+# Text-to-Speech (Yandex SpeechKit)
 # --------------------------------------------------------------------- #
-# SpeechKit TTS настройки
+set_speechkit_key(SPEECHKIT_API_KEY)
 
-set_speechkit_key("")
+SPEECHKIT_VOICE = "oksana"         # oksana, jane, alena, filipp, ermil
+SPEECHKIT_SPEED = "1.0"            # "0.1".."3.0"
+SPEECHKIT_FMT = "lpcm"             # 'lpcm' (WAV) или 'oggopus'/'mp3'
+SPEECHKIT_SR = 48000               # sample rate для lpcm
 
-SPEECHKIT_VOICE = "oksana"   # популярные: oksana, jane, alena, filipp, ermil
-SPEECHKIT_SPEED = "1.0"      # "0.1".."3.0"
-SPEECHKIT_FMT   = "lpcm"     # 'lpcm' (WAV) или 'oggopus'/'mp3'
-SPEECHKIT_SR    = 48000      # sample rate для lpcm
-
-#tts = pyttsx3.init()
-# Try to select a Russian voice (fallback to any available)
-#voices = tts.getProperty('voices')
-#for v in voices:
-#    if 'ru' in v.id.lower() or 'russian' in v.name.lower():
-#        tts.setProperty('voice', v.id)
-#        break
-#tts.setProperty('rate', 150)   # speech speed
-
-# --- CAMERA ---
+# --------------------------------------------------------------------- #
+# Camera initialization
+# --------------------------------------------------------------------- #
 print("Initializing camera...")
 cap = cv2.VideoCapture(CAMERA_INDEX)
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1024)
 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 768)
-#cap.set(cv2.CAP_PROP_FPS, 30)
 
 time.sleep(2)
+
 if not cap.isOpened():
     raise RuntimeError("FATAL: Cannot open camera! Check connection.")
 print("Camera ready")
 
-# --- Check first frame ---
+# Check first frame
 ret, _ = cap.read()
 if not ret:
     cap.release()
@@ -79,6 +70,7 @@ print("First frame OK")
 # Helper functions
 # --------------------------------------------------------------------- #
 def take_photo() -> str:
+    """Capture photo from camera and save to disk"""
     ret, frame = cap.read()
     if not ret:
         print("WARNING: Failed to grab frame")
@@ -89,37 +81,47 @@ def take_photo() -> str:
 
 
 def ask_gigachat(photo_path: str) -> str:
-    """Upload image and ask GigaChat what is on it."""
+    """
+    Upload image to GigaChat and ask for description.
+    Uses upload_file method (without base64).
+    """
     try:
-        file_obj = llm.upload_file(open(photo_path, "rb"))
+        # Открываем файл и загружаем в GigaChat
+        with open(photo_path, "rb") as f:
+            file_obj = llm.upload_file(f)
+        
+        # Запрос с прикреплённым файлом
         response = llm.invoke([
             HumanMessage(
-                content="Что ты видишь на этом фото? Начинай свой ответ так: Перед нами... Не используй в своем ответе такие слова как снимок, фотография, изображение и подобные! Это не фотография! Ты описываешь мне то, что ты реально видишь перед собой!",
+                content=(
+                    "Что ты видишь на этом фото? Начинай свой ответ так: Перед нами... "
+                    "Не используй в своём ответе такие слова как снимок, фотография, изображение и подобные! "
+                    "Это не фотография! Ты описываешь мне то, что ты реально видишь перед собой!"
+                ),
                 additional_kwargs={"attachments": [file_obj.id_]}
             )
         ])
         return response.content.strip()
     except Exception as e:
-        return f"GigaChat error: {e}"
+        print(f"GigaChat error: {e}")
+        return "Не удалось распознать изображение."
 
 
 def speak(text: str):
-    #tts.say(text)
-    #tts.runAndWait()
-    """Speak the text (blocking) via Yandex SpeechKit (REST)."""
+    """Speak text using Yandex SpeechKit"""
     print("Speaking:", text)
     try:
-        path = say_it(
+        audio_path = say_it(
             text,
             voice=SPEECHKIT_VOICE,
             speed=SPEECHKIT_SPEED,
             fmt=SPEECHKIT_FMT,
             sample_rate=SPEECHKIT_SR,
-            # save_to="/tmp/tts.wav"  # можно задать явный путь
         )
-        print("Audio saved:", path)
+        print("Audio saved:", audio_path)
     except Exception as e:
         print("TTS error:", e)
+
 
 # --------------------------------------------------------------------- #
 # Main loop
@@ -127,25 +129,34 @@ def speak(text: str):
 def main():
     detector = MotionDetector()
     time.sleep(1)
-    print(f"\nReady! Checking every {CHECK_INTERVAL}s\n")
+    print(f"\n✅ Ready! Checking every {CHECK_INTERVAL}s\n")
+    print("Press Ctrl+C to stop.\n")
 
     try:
         while True:
             time.sleep(CHECK_INTERVAL)
+            
             if detector.is_moving():
-                print("Motion → capturing...")
+                print("\n🚨 Motion detected!")
                 path = take_photo()
+                
                 if path:
+                    # Получаем описание от GigaChat
                     desc = ask_gigachat(path)
-                    print("GigaChat:", desc)
+                    print(f"💬 GigaChat: {desc}")
+                    
+                    # Озвучиваем
                     speak(desc)
+                    
+                    # Удаляем фото после обработки
                     subprocess.run(["rm", PHOTO_PATH])
                 else:
-                    speak("Camera error.")
+                    speak("Не удалось сделать снимок.")
             else:
-                print("No motion")
+                print(".", end="", flush=True)  # индикатор работы
+                
     except KeyboardInterrupt:
-        print("\nShutting down...")
+        print("\n\n🛑 Shutting down...")
     finally:
         cap.release()
         print("Camera released")
